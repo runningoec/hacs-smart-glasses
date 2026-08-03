@@ -39,6 +39,31 @@ async def test_invalid_token_is_unauthorized(
 
 
 @pytest.mark.asyncio
+async def test_call_service_requires_token(
+    hass_with_smart_glasses, hass_client_no_auth,
+):
+    """Service-executing path must 401 with no / short / wrong tokens."""
+    glasses = await hass_client_no_auth()
+    payload = {
+        "domain": "light",
+        "service": "turn_on",
+        "target": {"entity_id": "light.kitchen"},
+    }
+    for headers in (
+        {},
+        {"Authorization": "Bearer short"},
+        {"Authorization": "Bearer " + ("a" * 43)},
+        {"Authorization": "Basic abc"},
+    ):
+        res = await glasses.post(
+            "/api/smart_glasses/glance/call_service",
+            headers=headers,
+            json=payload,
+        )
+        assert res.status == 401, f"headers={headers!r} should be unauthorized"
+
+
+@pytest.mark.asyncio
 async def test_call_service_rejected_when_not_on_card(
     hass_with_smart_glasses, hass_client, hass_client_no_auth,
 ):
@@ -131,6 +156,89 @@ async def test_blocked_service_rejected_even_with_card(
         json={"domain": "homeassistant", "service": "restart"},
     )
     assert res.status == 403
+
+
+@pytest.mark.asyncio
+async def test_call_service_rejects_non_string_domain(
+    hass_with_smart_glasses, hass, hass_client, hass_client_no_auth,
+):
+    hass.states.async_set("light.kitchen", "off")
+    admin = await hass_client()
+    await admin.put(
+        "/api/smart_glasses/cards",
+        json={
+            "cards": [{
+                "id": "c", "name": "C",
+                "items": [{"type": "entity", "entity_id": "light.kitchen"}],
+            }],
+        },
+    )
+    token = await _pair_and_get_token(hass_client_no_auth, hass_client)
+    glasses = await hass_client_no_auth()
+    res = await glasses.post(
+        "/api/smart_glasses/glance/call_service",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "domain": ["light"],
+            "service": "toggle",
+            "target": {"entity_id": "light.kitchen"},
+        },
+    )
+    assert res.status == 400
+
+
+@pytest.mark.asyncio
+async def test_call_service_rate_limited_per_token(
+    hass_with_smart_glasses, hass, hass_client, hass_client_no_auth, monkeypatch,
+):
+    """A valid token still cannot spam call_service past the per-minute cap."""
+    from custom_components.smart_glasses import views as sg_views
+    from homeassistant.core import ServiceCall, callback
+
+    monkeypatch.setattr(sg_views, "CALL_SERVICE_PER_TOKEN_PER_MIN", 2)
+
+    hass.states.async_set("light.kitchen", "off")
+    admin = await hass_client()
+    await admin.put(
+        "/api/smart_glasses/cards",
+        json={
+            "cards": [{
+                "id": "c", "name": "C",
+                "items": [{"type": "entity", "entity_id": "light.kitchen"}],
+            }],
+        },
+    )
+
+    @callback
+    def _handle_toggle(call: ServiceCall) -> None:
+        return None
+
+    hass.services.async_register("homeassistant", "toggle", _handle_toggle)
+    await hass.async_block_till_done()
+
+    token = await _pair_and_get_token(hass_client_no_auth, hass_client)
+    glasses = await hass_client_no_auth()
+    payload = {
+        "domain": "homeassistant",
+        "service": "toggle",
+        "target": {"entity_id": "light.kitchen"},
+    }
+    headers = {"Authorization": f"Bearer {token}"}
+
+    assert (
+        await glasses.post(
+            "/api/smart_glasses/glance/call_service", headers=headers, json=payload
+        )
+    ).status == 200
+    assert (
+        await glasses.post(
+            "/api/smart_glasses/glance/call_service", headers=headers, json=payload
+        )
+    ).status == 200
+    limited = await glasses.post(
+        "/api/smart_glasses/glance/call_service", headers=headers, json=payload
+    )
+    assert limited.status == 429
 
 
 @pytest.mark.asyncio

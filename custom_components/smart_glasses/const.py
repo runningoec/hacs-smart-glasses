@@ -51,6 +51,16 @@ MAX_PENDING_PAIRINGS = 50
 # second; this is also the burst allowance.
 PAIR_START_PER_IP_PER_MIN = 6
 
+# Per-token rate limit on /glance/call_service. Caps how fast a stolen
+# glasses session token can fire card-scoped services even after auth
+# succeeds. Burst of 30/min is well above legitimate tap rates on a HUD.
+CALL_SERVICE_PER_TOKEN_PER_MIN = 30
+
+# secrets.token_urlsafe(32) always produces 43 ASCII characters. Reject
+# anything shorter before we even hash, so truncated/log-scraped values
+# never become a valid Bearer credential.
+GLASSES_TOKEN_MIN_LENGTH = 43
+
 # Resolves frontend bundle paths relative to this file (no matter where HA
 # installs the integration on disk).
 FRONTEND_DIR: Path = Path(__file__).parent / "frontend"
