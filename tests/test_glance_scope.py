@@ -192,8 +192,9 @@ async def test_call_service_rate_limited_per_token(
     hass_with_smart_glasses, hass, hass_client, hass_client_no_auth, monkeypatch,
 ):
     """A valid token still cannot spam call_service past the per-minute cap."""
+    from homeassistant.core import callback
+
     from custom_components.smart_glasses import views as sg_views
-    from homeassistant.core import ServiceCall, callback
 
     monkeypatch.setattr(sg_views, "CALL_SERVICE_PER_TOKEN_PER_MIN", 2)
 
@@ -210,7 +211,7 @@ async def test_call_service_rate_limited_per_token(
     )
 
     @callback
-    def _handle_toggle(call: ServiceCall) -> None:
+    def _handle_toggle(_call) -> None:
         return None
 
     hass.services.async_register("homeassistant", "toggle", _handle_toggle)

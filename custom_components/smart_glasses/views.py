@@ -260,9 +260,7 @@ def _sliding_window_allow(
 
 def _rate_limit_check(hass: HomeAssistant, ip: str) -> bool:
     """Return True if the /pair/start request from this IP is in budget."""
-    return _sliding_window_allow(
-        _pair_start_rate_limit(hass), ip, PAIR_START_PER_IP_PER_MIN
-    )
+    return _sliding_window_allow(_pair_start_rate_limit(hass), ip, PAIR_START_PER_IP_PER_MIN)
 
 
 def _call_service_rate_limit_check(hass: HomeAssistant, token_hash: str) -> bool:
