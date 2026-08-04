@@ -201,31 +201,42 @@ sequenceDiagram
 ### Re-pair / hand off to a different account
 
 On the glasses, hold **Shift + Escape** in the Web App to wipe local
-credentials and start over. From the HA panel, **Revoke** kills the
-token at the HA side too (the long-lived access token is removed from
-the approving user's profile).
+credentials and start over. From the HA panel, **Revoke** deletes the
+stored token hash immediately — the next glasses-side call gets 401 and
+must re-pair.
 
-## Pairing security
+## Authentication & security model
 
-Approval mints a 256-bit random session token. Only the **hash** of that
-token is stored on your HA — the plaintext is handed to the glasses once
-through `/pair/<id>/token` and then wiped from server-side state. Any
-glasses-side API call is Bearer-authenticated against the hash.
+> Full detail for reviewers: [`SECURITY.md`](SECURITY.md).
 
-The token's scope is exactly **the entities + actions currently on a card**.
-It cannot enumerate the rest of your HA, can't fire arbitrary services,
-can't subscribe to events for unrelated entities. The glasses never talk to
-HA's native `/api/*` — every call goes through scope-limited proxies:
+Glasses-facing views set `requires_auth = False` because a Meta Ray-Ban
+Web App cannot complete Home Assistant's login flow or safely hold an HA
+long-lived access token. An LLAT would also grant full HA API access;
+this integration instead issues its own opaque session token and proxies
+every glasses call through scope-limited endpoints.
+
+**Token model**
+
+1. An HA **admin** approves a pending `(session_id, code)` pair.
+2. Approval mints `secrets.token_urlsafe(32)` (~256 bits).
+3. Only `sha256(token)` is stored on HA. The plaintext is returned **once**
+   via `/pair/<id>/token`, then wiped from server state.
+4. Glasses send `Authorization: Bearer <token>` on every glance call.
+   Lookup uses a hash index plus `hmac.compare_digest`.
+5. Tokens are never written to logs or the audit trail.
+
+**What a valid token can do** — exactly the entities + actions on a card:
 
 | Glasses call | Backend behavior |
 |---|---|
-| `GET /api/smart_glasses/glance/cards`        | Returns current cards. |
-| `GET /api/smart_glasses/glance/states`       | Returns states **only** for entity_ids that appear on a card. |
-| `POST /api/smart_glasses/glance/call_service` | Rejects any (domain, service, target) tuple that isn't either (a) `homeassistant.toggle` against an entity item on a card, or (b) an exact match for an action item on a card. |
-| `WS  /api/smart_glasses/glance/ws`            | First message authenticates; thereafter streams `state_changed` events filtered to card entities. |
+| `GET /api/smart_glasses/glance/cards` | Returns current cards. |
+| `GET /api/smart_glasses/glance/states` | States **only** for entity_ids on a card. |
+| `POST /api/smart_glasses/glance/call_service` | Requires a validated Bearer token on every path; rejects anything not permitted by card config; drops caller-supplied service data; rate-limits to 30 calls/min/token; hard-blocks restart/supervisor/shell services. |
+| `WS  /api/smart_glasses/glance/ws` | First frame authenticates; then streams `state_changed` filtered to card entities. |
 
-Revoking from the panel deletes the hash. The next glasses-side call gets
-401 and re-pair kicks in.
+Static HTML/JS and the pairing bootstrap endpoints also use
+`requires_auth = False`, but none of them call HA services. Panel
+management APIs use `requires_auth = True` and require an admin user.
 
 ### Reverse-proxy caveat
 
@@ -324,9 +335,13 @@ read-only in the panel UI — set them in the YAML editor.
 
 ## Status
 
+- **v0.11.0**: HACS review feedback — documented webhook-style token model
+  in `SECURITY.md`, centralized glasses auth via `_require_glasses_pairing`,
+  stricter Bearer parsing, per-token `call_service` rate limit, and refusal
+  of non-string / extra service-data inputs on the proxy.
 - **v0.10.2**: consolidated panel layout (pairings, Dashboard, collapsible
   setup/YAML/audit), value-as-headline grid cells, ghost-preview tabs,
   tap-to-confirm with inline or YAML-defined rules, scoped proxy auth,
   audit logging, and row-edge card handoff for Left/Right navigation.
-- **Roadmap**: first GitHub release, HACS default-store submission,
-  fuller HA integration test coverage, and more translations.
+- **Roadmap**: HACS default-store merge, fuller HA integration test
+  coverage, and more translations.

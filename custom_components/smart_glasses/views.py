@@ -2,23 +2,29 @@
 
 Three audiences, three auth modes:
 
-1. **Glasses Web App pairing-bootstrap** (no auth). The brief window during
-   which a freshly-launched glasses app gets a pairing code and waits for it
-   to be approved:
+1. **Glasses Web App pairing-bootstrap** (``requires_auth = False``).
+   Static HTML/JS plus the short-lived pairing handshake. None of these
+   paths call Home Assistant services:
    - ``GET  /smart-glasses-app``                          — fetch the HTML
+   - ``GET  /smart_glasses_static/favicon-192x192.png``
+   - ``GET  /api/smart_glasses/panel.js``
    - ``POST /api/smart_glasses/pair/start``               — request a code
    - ``GET  /api/smart_glasses/pair/{session_id}/token``  — poll for approval
 
-2. **Glasses Web App day-to-day** (Bearer auth with our session token).
-   After approval the glasses use these proxy endpoints — they never call
-   HA's native /api/* anymore, so the token's scope is exactly "the entities
-   and actions currently on a card":
+2. **Glasses Web App day-to-day** (``requires_auth = False`` + custom Bearer).
+   Meta Ray-Ban Web Apps cannot complete Home Assistant's login / LLAT flow,
+   so these views intentionally bypass HA auth middleware and authenticate
+   with an opaque pairing token instead. Every handler below MUST call
+   ``_require_glasses_pairing`` (or the websocket equivalent) before doing
+   any work — there is no service-executing path that skips that check.
+   The glasses never call HA's native ``/api/*``; token scope is exactly
+   "the entities and actions currently on a card":
    - ``GET  /api/smart_glasses/glance/cards``
-   - ``GET  /api/smart_glasses/glance/states``    — only entities on cards
+   - ``GET  /api/smart_glasses/glance/states``       — only entities on cards
    - ``POST /api/smart_glasses/glance/call_service`` — only services on cards
-   - ``WS   /api/smart_glasses/glance/ws``         — filtered state_changed
+   - ``WS   /api/smart_glasses/glance/ws``            — filtered state_changed
 
-3. **Phone / desktop browser** (HA admin). The management surface:
+3. **Phone / desktop browser** (``requires_auth = True``, admin user).
    - ``GET  /api/smart_glasses/pairings``
    - ``POST /api/smart_glasses/pair/approve``     — bound to (code, session_id)
    - ``DELETE /api/smart_glasses/pair/{session_id}``
@@ -26,8 +32,8 @@ Three audiences, three auth modes:
    - ``GET/PUT /api/smart_glasses/cards/yaml``
    - ``GET  /api/smart_glasses/audit``
 
-The custom panel's JS bundle is served by ``PanelJsView`` with no-store
-Cache-Control so CDN-fronted HA installs (Cloudflare etc.) pick up updates.
+See ``SECURITY.md`` for the full token model (entropy, storage, scope,
+revocation) that reviewers should evaluate instead of HA LLATs.
 """
 
 from __future__ import annotations
@@ -47,10 +53,12 @@ from homeassistant.core import HomeAssistant, callback
 
 from .const import (
     API_PREFIX,
+    CALL_SERVICE_PER_TOKEN_PER_MIN,
     DOMAIN,
     FAVICON_PATH,
     GLASSES_APP_URL,
     GLASSES_HTML_PATH,
+    GLASSES_TOKEN_MIN_LENGTH,
     MAX_ENTITIES,
     MAX_PENDING_PAIRINGS,
     PAIR_START_PER_IP_PER_MIN,
@@ -188,6 +196,11 @@ def _pair_start_rate_limit(hass: HomeAssistant) -> dict[str, list[float]]:
     return hass.data[DOMAIN].setdefault("pair_start_rate_limit", {})
 
 
+def _call_service_rate_limit(hass: HomeAssistant) -> dict[str, list[float]]:
+    """Per-hass in-memory rate limit buckets for /glance/call_service."""
+    return hass.data[DOMAIN].setdefault("call_service_rate_limit", {})
+
+
 def _last_poll_times(hass: HomeAssistant) -> dict[str, float]:
     """Per-hass in-memory token poll timestamps keyed by session id."""
     return hass.data[DOMAIN].setdefault("last_poll", {})
@@ -222,25 +235,39 @@ async def _prune_inactive_pairings(hass: HomeAssistant, store) -> int:
     return removed
 
 
-def _rate_limit_check(hass: HomeAssistant, ip: str) -> bool:
-    """Return True if the request from this IP is within the budget.
+def _sliding_window_allow(
+    buckets: dict[str, list[float]],
+    key: str,
+    limit: int,
+) -> bool:
+    """Return True if ``key`` is still under ``limit`` hits in the window.
 
-    The dict only stores timestamps inside the current 60-second window, so
-    memory stays bounded as long as the host of IPs hitting us is finite.
+    Mutates ``buckets`` in place. Only timestamps inside the current window
+    are retained, so memory stays bounded for a finite set of keys.
     """
     now = time.time()
-    buckets = _pair_start_rate_limit(hass)
-    recent = [t for t in buckets.get(ip, []) if now - t < _RATE_LIMIT_WINDOW_SEC]
-    if len(recent) >= PAIR_START_PER_IP_PER_MIN:
-        buckets[ip] = recent
+    recent = [t for t in buckets.get(key, []) if now - t < _RATE_LIMIT_WINDOW_SEC]
+    if len(recent) >= limit:
+        buckets[key] = recent
         return False
     recent.append(now)
-    buckets[ip] = recent
-    # Opportunistic eviction: every now and then, drop empty IP entries.
+    buckets[key] = recent
     if len(buckets) > 256:
-        for k in [k for k, v in buckets.items() if not v]:
-            buckets.pop(k, None)
+        for stale in [k for k, v in buckets.items() if not v]:
+            buckets.pop(stale, None)
     return True
+
+
+def _rate_limit_check(hass: HomeAssistant, ip: str) -> bool:
+    """Return True if the /pair/start request from this IP is in budget."""
+    return _sliding_window_allow(_pair_start_rate_limit(hass), ip, PAIR_START_PER_IP_PER_MIN)
+
+
+def _call_service_rate_limit_check(hass: HomeAssistant, token_hash: str) -> bool:
+    """Return True if this glasses token may fire another call_service."""
+    return _sliding_window_allow(
+        _call_service_rate_limit(hass), token_hash, CALL_SERVICE_PER_TOKEN_PER_MIN
+    )
 
 
 _TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
@@ -509,10 +536,12 @@ class PairingsListView(HomeAssistantView):
 
 
 class PairApproveView(HomeAssistantView):
-    """Approve a pending pairing by its short code. Mints an LLAT for the
-    user making this call, stashes it on the pairing record, and returns
-    success. The glasses pick the token up via PairTokenView on their next
-    poll."""
+    """Approve a pending pairing by its short code.
+
+    Mints an opaque 256-bit session token for the glasses, stores only its
+    SHA-256 hash on the pairing record, and returns success. The glasses
+    pick the plaintext up once via PairTokenView on their next poll.
+    """
 
     url = f"{API_PREFIX}/pair/approve"
     name = f"{DOMAIN}:pair_approve"
@@ -728,14 +757,55 @@ class CardsYamlView(HomeAssistantView):
 # ---------------------------------------------------------------------------
 
 
+def _extract_glasses_token(auth_header: str) -> str | None:
+    """Pull a plausible glasses Bearer token out of an Authorization header.
+
+    Rejects missing/non-Bearer schemes and values shorter than the fixed
+    ``secrets.token_urlsafe(32)`` length so truncated scraps never hash-match.
+    """
+    if not auth_header.startswith("Bearer "):
+        return None
+    token = auth_header[7:].strip()
+    if len(token) < GLASSES_TOKEN_MIN_LENGTH:
+        return None
+    # token_urlsafe alphabet is URL-safe base64 without padding; reject
+    # anything else early so we don't hash attacker-controlled blobs of
+    # arbitrary shape.
+    if any(c in token for c in " \t\r\n"):
+        return None
+    return token
+
+
 def _glasses_pairing(request: web.Request, hass: HomeAssistant) -> dict[str, Any] | None:
     """Authenticate a glasses request. Returns the pairing dict on success,
     None on failure. Caller is responsible for sending 401 if None."""
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        return None
-    token = auth[7:].strip()
+    token = _extract_glasses_token(request.headers.get("Authorization", ""))
     if not token:
+        return None
+    return _store(hass).find_pairing_by_token(token)
+
+
+def _require_glasses_pairing(
+    view: HomeAssistantView, request: web.Request, hass: HomeAssistant
+) -> tuple[dict[str, Any] | None, web.Response | None]:
+    """Shared gate for every glasses proxy view.
+
+    Returns ``(pairing, None)`` on success or ``(None, 401 response)`` on
+    failure. Callers must return the error response immediately — this is
+    the single place service-executing paths authenticate, so skipping it
+    is an obvious review red flag.
+    """
+    pairing = _glasses_pairing(request, hass)
+    if pairing is None:
+        return None, view.json_message("invalid token", status_code=401)
+    return pairing, None
+
+
+def _lookup_glasses_token(hass: HomeAssistant, token: Any) -> dict[str, Any] | None:
+    """Authenticate a token from a websocket first-frame payload."""
+    if not isinstance(token, str) or len(token) < GLASSES_TOKEN_MIN_LENGTH:
+        return None
+    if any(c in token for c in " \t\r\n"):
         return None
     return _store(hass).find_pairing_by_token(token)
 
@@ -903,8 +973,9 @@ class GlanceCardsView(HomeAssistantView):
 
     async def get(self, request: web.Request) -> web.Response:
         hass: HomeAssistant = request.app["hass"]
-        if not _glasses_pairing(request, hass):
-            return self.json_message("invalid token", status_code=401)
+        _pairing, err = _require_glasses_pairing(self, request, hass)
+        if err is not None:
+            return err
         return self.json({"cards": _store(hass).cards})
 
 
@@ -919,8 +990,9 @@ class GlanceStatesView(HomeAssistantView):
 
     async def get(self, request: web.Request) -> web.Response:
         hass: HomeAssistant = request.app["hass"]
-        if not _glasses_pairing(request, hass):
-            return self.json_message("invalid token", status_code=401)
+        _pairing, err = _require_glasses_pairing(self, request, hass)
+        if err is not None:
+            return err
         wanted = _card_entity_ids(_store(hass).cards)
         out = []
         for eid in wanted:
@@ -933,7 +1005,12 @@ class GlanceStatesView(HomeAssistantView):
 class GlanceCallServiceView(HomeAssistantView):
     """Scoped service-call proxy. Only services + targets present on a card
     are accepted. Implements both the implicit toggle (when the glasses tap
-    an entity cell) and explicit action items."""
+    an entity cell) and explicit action items.
+
+    Auth is mandatory via ``_require_glasses_pairing`` — this view never
+    reaches ``hass.services.async_call`` without a validated pairing token,
+    a successful card-scope check, and a per-token rate-limit slot.
+    """
 
     url = f"{API_PREFIX}/glance/call_service"
     name = f"{DOMAIN}:glance_call_service"
@@ -941,8 +1018,22 @@ class GlanceCallServiceView(HomeAssistantView):
 
     async def post(self, request: web.Request) -> web.Response:
         hass: HomeAssistant = request.app["hass"]
-        if not _glasses_pairing(request, hass):
+        pairing, err = _require_glasses_pairing(self, request, hass)
+        if err is not None:
+            return err
+        assert pairing is not None  # for type checkers; err path returned above
+
+        token_hash = pairing.get("token_hash")
+        if not isinstance(token_hash, str) or not token_hash:
+            # Approved pairings always have a hash; treat a corrupt record as
+            # unauthenticated rather than proceeding.
             return self.json_message("invalid token", status_code=401)
+        if not _call_service_rate_limit_check(hass, token_hash):
+            return self.json_message(
+                "too many service calls; try again in a minute",
+                status_code=429,
+            )
+
         raw = await _read_body_capped(request, max_bytes=4096)
         if raw is None:
             return self.json_message("body too large", status_code=413)
@@ -950,10 +1041,23 @@ class GlanceCallServiceView(HomeAssistantView):
             body: dict[str, Any] = json.loads(raw)
         except (json.JSONDecodeError, ValueError):
             return self.json_message("invalid json", status_code=400)
+        if not isinstance(body, dict):
+            return self.json_message("invalid json", status_code=400)
+
         domain = body.get("domain")
         service = body.get("service")
+        if not isinstance(domain, str) or not isinstance(service, str):
+            return self.json_message("domain and service must be strings", status_code=400)
+        # Ignore any caller-supplied service data. The glasses proxy only
+        # forwards domain/service/target — never brightness, code, etc. —
+        # so a leaked token cannot smuggle privileged kwargs.
         target = body.get("target") or {}
+        if target is not None and not isinstance(target, dict):
+            return self.json_message("target must be an object", status_code=400)
         target_eid = target.get("entity_id") if isinstance(target, dict) else None
+        if target_eid is not None and not isinstance(target_eid, str):
+            return self.json_message("target.entity_id must be a string", status_code=400)
+
         if not _service_call_allowed(_store(hass).cards, domain, service, target_eid):
             return self.json_message("service call not permitted by card config", status_code=403)
         try:
@@ -1010,7 +1114,7 @@ class GlanceWebSocketView(HomeAssistantView):
             await ws.close()
             return ws
         token = msg.get("access_token") or msg.get("token")
-        pairing = _store(hass).find_pairing_by_token(token) if token else None
+        pairing = _lookup_glasses_token(hass, token)
         if not pairing:
             await ws.send_json({"type": "auth_invalid"})
             await ws.close()
